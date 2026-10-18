@@ -1,9 +1,20 @@
 # Humble Steam Key Redeemer
+
+Fork of [FailSpy/humble-steam-key-redeemer](https://github.com/FailSpy/humble-steam-key-redeemer).
+
 Python utility script to extract Humble keys, and redeem them on Steam automagically by detecting when a game is already owned on Steam.
 
 This is primarily designed to be a set-it-and-forget-it tool that maximizes successful entry of keys into Steam, assuring that no Steam game goes unredeemed.
 
 This script will login to both Humble and Steam, automating the whole process. It's not perfect as I made this mostly for my own personal case and couldn't test all possibilities so YMMV. Feel free to send submit an issue if you do bump into issues.
+
+## Notes on this fork
+
+I ran into a few problems using the original (timeouts with large Humble libraries, Steam owned-game lookup failing on bigger libraries / the old app catalog API). This fork has some minor updates to work around those cases:
+
+- Higher timeouts and batched Humble order fetching
+- Steam ownership check via userdata when the full app catalog is unavailable
+- Windows `run_redeemer.bat` uses `python` instead of `py`
 
 Any revealing and redeeming the script does will output to spreadsheet files based on their actions for you to easily review what actions it took and whether it redeemed, skipped, or failed on specific keys.
 

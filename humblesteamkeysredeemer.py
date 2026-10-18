@@ -75,6 +75,7 @@ if (list){
 var getHumbleOrderDetails = async (list) => {
   const HUMBLE_ORDERS_API_URL = 'https://www.humblebundle.com/api/v1/user/order';
   const HUMBLE_ORDER_DETAILS_API = 'https://www.humblebundle.com/api/v1/order/';
+  const CONCURRENCY = 6;
 
   try {
     var orders = []
@@ -82,24 +83,49 @@ var getHumbleOrderDetails = async (list) => {
       orders = list.map(item => ({ gamekey: item }));
     } else {
       const response = await fetch(HUMBLE_ORDERS_API_URL);
+      if (!response.ok) {
+        throw new Error('Failed to list orders: HTTP ' + response.status);
+      }
       orders = await response.json();
     }
-    const orderDetailsPromises = orders.map(async (order) => {
-      const orderDetailsUrl = `${HUMBLE_ORDER_DETAILS_API}${order['gamekey']}?all_tpkds=true`;
-      const orderDetailsResponse = await fetch(orderDetailsUrl);
-      const orderDetails = await orderDetailsResponse.json();
-      return orderDetails;
-    });
 
-    const orderDetailsArray = await Promise.all(orderDetailsPromises);
+    const orderDetailsArray = [];
+    for (let i = 0; i < orders.length; i += CONCURRENCY) {
+      const batch = orders.slice(i, i + CONCURRENCY);
+      const batchResults = await Promise.all(batch.map(async (order) => {
+        const orderDetailsUrl = `${HUMBLE_ORDER_DETAILS_API}${order['gamekey']}?all_tpkds=true`;
+        for (let attempt = 0; attempt < 3; attempt++) {
+          try {
+            const orderDetailsResponse = await fetch(orderDetailsUrl);
+            if (!orderDetailsResponse.ok) {
+              throw new Error('HTTP ' + orderDetailsResponse.status);
+            }
+            return await orderDetailsResponse.json();
+          } catch (err) {
+            if (attempt === 2) {
+              console.error('Failed order', order['gamekey'], err);
+              return null;
+            }
+            await new Promise(r => setTimeout(r, 750 * (attempt + 1)));
+          }
+        }
+        return null;
+      }));
+      for (const item of batchResults) {
+        if (item !== null) {
+          orderDetailsArray.push(item);
+        }
+      }
+    }
     return orderDetailsArray;
   } catch (error) {
     console.error('Error:', error);
+    done({__error: String(error)});
     return [];
   }
 };
 
-getHumbleOrderDetails(list).then(r => {done(r)});
+getHumbleOrderDetails(list).then(r => {done(r)}).catch(e => {done({__error: String(e)})});
 '''
 
 fetch_cmd = '''
@@ -151,6 +177,9 @@ def get_headless_driver():
             else:
                 options.add_argument("-headless")
             driver = d(options=options)
+            # Large Humble libraries can take a long time to fetch order details
+            driver.set_script_timeout(3600)
+            driver.set_page_load_timeout(300)
             process_quit(driver) # make sure driver closes when we close
             return driver
         except WebDriverException as e:
@@ -419,7 +448,7 @@ def _redeem_steam(session, key, quiet=False):
     if key == "":
         return 0
     session_id = session.cookies.get_dict()["sessionid"]
-    r = session.post(STEAM_REDEEM_API, data={"product_key": key, "sessionid": session_id})
+    r = session.post(STEAM_REDEEM_API, data={"product_key": key, "sessionid": session_id}, timeout=120)
     blob = r.json()
 
     if blob["success"] == 1:
@@ -559,13 +588,44 @@ def prompt_yes_no(question):
             return True if ans == "y" else False
 
 def get_owned_apps(steam_session):
-    owned_content = steam_session.get(STEAM_USERDATA_API).json()
-    owned_app_ids = owned_content["rgOwnedPackages"] + owned_content["rgOwnedApps"]
-    owned_app_details = {
-        app["appid"]: app["name"]
-        for app in steam_session.get(STEAM_APP_LIST_API).json()["applist"]["apps"]
-        if app["appid"] in owned_app_ids
-    }
+    # userdata returns the full owned library in one response (no pagination needed,
+    # even with 1000+ games). The old GetAppList/v2 catalog API is often empty/broken.
+    print("Fetching Steam owned library (this can take a while with large libraries)...")
+    resp = steam_session.get(STEAM_USERDATA_API, timeout=300)
+    try:
+        owned_content = resp.json()
+    except ValueError:
+        preview = (resp.text or "")[:200].replace("\n", " ")
+        raise RuntimeError(
+            f"Steam userdata was not JSON (status {resp.status_code}). Preview: {preview}"
+        )
+
+    owned_app_ids = set(owned_content.get("rgOwnedApps") or [])
+    owned_package_ids = set(owned_content.get("rgOwnedPackages") or [])
+    print(f"Steam reports {len(owned_app_ids)} owned apps and {len(owned_package_ids)} packages")
+
+    owned_app_details = {}
+
+    # Best-effort name lookup from Steam catalog (may fail; ownership by ID still works)
+    try:
+        print("Trying Steam app catalog for names (optional, may time out)...")
+        catalog_resp = steam_session.get(STEAM_APP_LIST_API, timeout=300)
+        if catalog_resp.ok and catalog_resp.text and catalog_resp.text.strip():
+            apps = catalog_resp.json().get("applist", {}).get("apps", [])
+            owned_app_details = {
+                app["appid"]: app["name"]
+                for app in apps
+                if app.get("appid") in owned_app_ids
+            }
+            print(f"Resolved names for {len(owned_app_details)}/{len(owned_app_ids)} owned apps")
+        else:
+            print(f"Steam catalog unavailable (status {catalog_resp.status_code}); using ID-only matching")
+    except Exception as e:
+        print(f"Steam catalog lookup failed ({e}); using ID-only matching")
+
+    for appid in owned_app_ids:
+        owned_app_details.setdefault(appid, f"App {appid}")
+
     return owned_app_details
 
 def match_ownership(owned_app_details, game, filter_live):
@@ -907,9 +967,26 @@ if __name__=="__main__":
     humble_login(driver)
     print("Successfully signed in on Humble.")
 
-    print(f"Getting order details, please wait")
+    print("Getting order details, please wait (can take several minutes with many purchases)...")
 
-    order_details = driver.execute_async_script(getHumbleOrders.replace('%optional%',''))
+    order_details = None
+    for attempt in range(1, 4):
+        try:
+            order_details = driver.execute_async_script(getHumbleOrders.replace('%optional%',''))
+            if isinstance(order_details, dict) and order_details.get('__error'):
+                raise RuntimeError(order_details['__error'])
+            if not isinstance(order_details, list):
+                raise RuntimeError(f"Unexpected response type: {type(order_details)}")
+            break
+        except Exception as e:
+            print(f"Attempt {attempt}/3 failed getting order details: {e}")
+            if attempt == 3:
+                print("Crashed getting the order details. See error.log for details.")
+                raise
+            print("Retrying...")
+            time.sleep(3)
+
+    print(f"Loaded {len(order_details)} orders.")
 
     desired_mode = prompt_mode(order_details,driver)
     if(desired_mode == "2"):
